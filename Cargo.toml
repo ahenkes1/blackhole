@@ -1,0 +1,16 @@
+[package]
+name = "blackhole"
+version = "0.1.0"
+edition = "2021"
+description = "Schwarzschild black-hole accretion-disk screensaver for monochrome terminals"
+license = "MIT"
+
+# Zero dependencies by design: pure std + ANSI escapes + stty(1).
+
+[lib]
+# Doc comments hold math formulas (```text blocks), not runnable Rust examples.
+doctest = false
+
+[profile.release]
+lto = true
+codegen-units = 1
