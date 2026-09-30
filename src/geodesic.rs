@@ -210,38 +210,44 @@ pub struct Fan {
 }
 
 impl Fan {
-    /// Integrate the whole fan, chunked across worker threads. Each ray is an
-    /// independent f64 integration, so the result is bit-identical to a serial
-    /// build regardless of thread count or chunking.
+    /// Integrate the whole fan across worker threads. Rays are dealt out
+    /// round-robin (thread t takes rays t, t + n_threads, …): the expensive
+    /// near-critical rays that wind around the photon sphere sit in one
+    /// narrow δ-band, which a contiguous split would hand to a single thread.
+    /// Each ray is an independent f64 integration, so the result is
+    /// bit-identical to a serial build regardless of thread count.
     pub fn build(r_cam: f64, delta_max: f64, n: usize, r_escape: f64) -> Fan {
         let n = n.max(2);
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
             .min(n);
-        let chunk = n.div_ceil(n_threads);
-        let mut parts: Vec<Vec<Ray>> = Vec::with_capacity(n_threads);
+        let mut slots: Vec<Option<Ray>> = vec![None; n];
         std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_threads);
-            for t in 0..n_threads {
-                let (i0, i1) = (t * chunk, ((t + 1) * chunk).min(n));
-                if i0 >= i1 {
-                    break;
-                }
-                handles.push(s.spawn(move || {
-                    (i0..i1)
-                        .map(|i| {
-                            integrate_ray(r_cam, delta_max * i as f64 / (n - 1) as f64, r_escape)
-                        })
-                        .collect()
-                }));
-            }
+            let handles: Vec<_> = (0..n_threads)
+                .map(|t| {
+                    s.spawn(move || {
+                        (t..n)
+                            .step_by(n_threads)
+                            .map(|i| {
+                                let delta = delta_max * i as f64 / (n - 1) as f64;
+                                (i, integrate_ray(r_cam, delta, r_escape))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
             for hd in handles {
-                parts.push(hd.join().expect("fan build thread panicked"));
+                for (i, ray) in hd.join().expect("fan build thread panicked") {
+                    slots[i] = Some(ray);
+                }
             }
         });
         Fan {
-            rays: parts.into_iter().flatten().collect(),
+            rays: slots
+                .into_iter()
+                .map(|r| r.expect("every ray is integrated"))
+                .collect(),
             delta_max,
             r_cam,
         }
@@ -368,9 +374,10 @@ mod tests {
             assert!((r - ray.r[k] as f64).abs() < 1e-4, "node {k}");
         }
         assert!(ray.r_at_phi_with_hint(-0.1, &mut cursor).is_none());
-        assert!(ray
-            .r_at_phi_with_hint(ray.phi_end() + 1.0, &mut cursor)
-            .is_none());
+        assert!(
+            ray.r_at_phi_with_hint(ray.phi_end() + 1.0, &mut cursor)
+                .is_none()
+        );
     }
 
     #[test]
@@ -378,6 +385,10 @@ mod tests {
         let a = Fan::build(60.0, 0.35, 97, 150.0);
         let b = Fan::build(60.0, 0.35, 97, 150.0);
         assert_eq!(a.rays.len(), 97);
+        for (i, ray) in a.rays.iter().enumerate() {
+            let delta = 0.35 * i as f64 / 96.0;
+            assert_eq!(ray.delta, delta, "ray {i} out of order");
+        }
         for i in [0, 48, 96] {
             assert_eq!(a.rays[i].b, b.rays[i].b, "b differs at ray {i}");
             assert_eq!(a.rays[i].phi, b.rays[i].phi, "polyline differs at ray {i}");

@@ -6,23 +6,33 @@
 //! per-frame work here is only:
 //!
 //! ```text
-//!     I(cell) = base + Σ_hits weight · tex(φ₀ − ω·t, t)
+//!     I(cell) = base + Σ_hits weight · tex(φ₀, ω, t)
 //! ```
 //!
-//! `tex` is the brightness of the co-rotating turbulent pattern at disk
-//! azimuth ψ (already advected: ψ = φ₀ − ω t with ω = ±Ω(r_hit) baked into
-//! the hit). Differential rotation shears the pattern into spirals, and the
-//! slow drift phases make it flicker:
+//! `tex` is the brightness of the co-rotating turbulent pattern seen at the
+//! hit's fixed disk azimuth φ₀, with ω = ±Ω(r_hit) baked into the hit.
+//! Differential rotation shears the pattern into spirals. Left alone, the
+//! shear winds it ever tighter (the phase gradient across radii grows ∝ t)
+//! until, after minutes, neighbouring cells decorrelate into flat grain. So
+//! the turbulence has a finite lifetime, like real disk turbulence: patterns
+//! are born every L/2 ([`LIFETIME`] L), fade in and out with weight
+//! sin²(π·age/L), and each is advected only by its own age:
 //!
 //! ```text
-//!     tex(ψ, t) = 1 + Σ_k a_k · sin(m_k·ψ + c_k·t)
+//!     tex(φ₀, ω, t) = 1 + Σ_gen w_gen Σ_k a_k · sin(m_k·(φ₀ − ω·age_gen) + ρ_gen,k + c_k·age_gen)
 //! ```
 //!
-//! with Σ a_k < 1 so tex > 0 everywhere. [`Animator`] evaluates exactly this
-//! sum, restructured for speed and for precision over days of animation.
+//! Exactly two generations are alive at any t and their weights sum to 1,
+//! so Σ a_k < 1 keeps tex > 0 and its mean at 1. ρ_gen,k are random phases
+//! per generation (a new pattern each time), c_k slow drifts that make it
+//! flicker. [`Animator`] evaluates exactly this sum, restructured for speed.
+//!
+//! All images of the disk (primary, secondary, …) are evaluated at the same
+//! t: the extra light-travel time of the higher-order images (≈ π·r) is
+//! ignored — invisible for a random texture.
 
-use crate::map::LensingMap;
-use std::f64::consts::TAU;
+use crate::map::{LensingMap, splitmix64};
+use std::f64::consts::{PI, TAU};
 
 /// Keplerian angular velocity of a circular orbit at radius r (M = 1).
 pub fn omega(r: f64) -> f64 {
@@ -31,14 +41,54 @@ pub fn omega(r: f64) -> f64 {
 
 /// Azimuthal harmonics of the turbulence texture: (m, amplitude, drift rad/s).
 pub const HARMONICS: [(f32, f32, f32); 2] = [(3.0, 0.55, 0.11), (7.0, 0.30, -0.07)];
+const NH: usize = HARMONICS.len();
 
-/// Turbulent brightness at advected disk azimuth `psi`, animation time `t`.
-/// Strictly positive; ≈ 1 on average. Reference definition: [`Animator`]
-/// computes the same function without its f32 precision loss at large `t`.
-pub fn tex(psi: f32, t: f32) -> f32 {
+/// Lifetime L of one turbulence pattern, in sim units (2 min of wall time at
+/// default speed). Bounds the shear winding: a pattern is at most L old, so
+/// adjacent cells stay correlated forever instead of for a few minutes.
+pub const LIFETIME: f64 = 960.0;
+
+/// One of the two turbulence patterns alive at a given time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Generation {
+    /// Fade weight sin²(π·age/L); the two alive weights sum to 1.
+    pub weight: f64,
+    /// Time since the pattern's birth, in [0, L).
+    pub age: f64,
+    /// Per-harmonic phase ρ_k + c_k·age, wrapped to [0, 2π).
+    pub phase: [f64; NH],
+}
+
+/// The two pattern generations alive at sim time `t` (any sign): generation
+/// g is born at g·L/2 and dies at g·L/2 + L. A pure function of `t`.
+pub fn generations(t: f64) -> [Generation; 2] {
+    let half = LIFETIME / 2.0;
+    let g = (t / half).floor();
+    let young_age = t - g * half; // [0, L/2)
+    let r#gen = |id: f64, age: f64| {
+        let seed = splitmix64(id as i64 as u64);
+        Generation {
+            weight: (PI * age / LIFETIME).sin().powi(2),
+            age,
+            phase: std::array::from_fn(|k| {
+                let rho = (splitmix64(seed ^ k as u64) >> 11) as f64 * (TAU / (1u64 << 53) as f64);
+                (rho + HARMONICS[k].2 as f64 * age).rem_euclid(TAU)
+            }),
+        }
+    };
+    [r#gen(g, young_age), r#gen(g - 1.0, young_age + half)]
+}
+
+/// Turbulent brightness at disk azimuth `phi0` (angular velocity `omega`),
+/// sim time `t`, per the module-level formula, in f64. Strictly positive,
+/// 1 on average. Reference definition for [`Animator`].
+pub fn tex(phi0: f64, omega: f64, t: f64) -> f64 {
     let mut v = 1.0;
-    for (m, a, c) in HARMONICS {
-        v += a * (m * psi + c * t).sin();
+    for g in generations(t) {
+        let psi = phi0 - omega * g.age;
+        for (k, &(m, a, _)) in HARMONICS.iter().enumerate() {
+            v += g.weight * a as f64 * (m as f64 * psi + g.phase[k]).sin();
+        }
     }
     v
 }
@@ -64,39 +114,24 @@ pub fn profile(r: f64, r_in: f64, r_out: f64) -> f64 {
     g(x) / g(x_star)
 }
 
-/// Spacing of the time origins the [`Animator`] re-anchors to (sim units;
-/// 32 s of wall time at default speed). Bounds the kernel's local time
-/// |τ| ≤ EPOCH_STEP/2, hence its sine arguments to |m·ψ| ≲ 90.
-pub const EPOCH_STEP: f64 = 256.0;
-
 /// Cells per kernel block: the block's per-hit values stay in L1 between
 /// the texture pass and the per-cell sums.
 const BLOCK: usize = 256;
 
 /// Per-frame evaluator of the animated disk through a [`LensingMap`].
 ///
-/// Precision: the pattern phase m·(φ₀ − ω·t) + c·t grows without bound, and
-/// an f32 `t` stops resolving the per-frame step (0.4 sim units at defaults)
-/// after a few days. So every hit's phase is re-anchored, in f64, at an epoch
-/// T — the multiple of [`EPOCH_STEP`] nearest to t:
-///
-/// ```text
-///     ψ₀ = wrap(φ₀ − ω·T),   drift_k = (c_k·t) mod 2π
-/// ```
-///
-/// and the f32 kernel only sees the small local time τ = t − T. T depends on
-/// t alone, so a frame is a pure function of t, whatever was evaluated before.
+/// Precision: everything unbounded in t (generation index, drift phases) is
+/// resolved per frame in f64 by [`generations`]; the f32 kernel only sees
+/// pattern ages < [`LIFETIME`] and phases wrapped to [0, 2π), so the
+/// animation stays exact for days and a frame is a pure function of t.
 ///
 /// Speed: libm `sinf` is an opaque call whose branches mispredict once
-/// differential rotation has scrambled the phases (after minutes of runtime,
-/// frames got ~2.5× slower than at start-up). The kernel instead streams the
-/// structure-of-arrays hits through a branch-free polynomial sine
-/// (`fast_sin`), which vectorizes, then sums each cell's hits.
+/// differential rotation has scrambled the phases. The kernel instead
+/// streams the structure-of-arrays hits through a branch-free polynomial
+/// sine (`fast_sin`), which vectorizes, then sums each cell's hits.
 #[derive(Debug, Clone)]
 pub struct Animator {
-    epoch: f64,
-    /// Per-hit pattern azimuth at `epoch`, wrapped to [−π, π].
-    psi0: Vec<f32>,
+    n_hits: usize,
     /// Per-hit texture values of one block of cells.
     vals: Vec<f32>,
 }
@@ -110,8 +145,7 @@ impl Animator {
             .max()
             .unwrap_or(0);
         Animator {
-            epoch: f64::NAN,
-            psi0: vec![0.0; map.hits.len()],
+            n_hits: map.hits.len(),
             vals: vec![0.0; max_block_hits],
         }
     }
@@ -123,16 +157,15 @@ impl Animator {
         let n = map.w * map.h;
         assert_eq!(out.len(), n);
         assert_eq!(
-            self.psi0.len(),
+            self.n_hits,
             map.hits.len(),
             "Animator used with a different map"
         );
-        let epoch = (t / EPOCH_STEP).round() * EPOCH_STEP;
-        if epoch != self.epoch {
-            self.rebase(map, epoch);
-        }
-        let tau = (t - epoch) as f32;
-        let drift = HARMONICS.map(|(_, _, c)| (c as f64 * t).rem_euclid(TAU) as f32);
+        let gens = generations(t);
+        let age = gens.map(|g| g.age as f32);
+        let amp: [[f32; NH]; 2] =
+            gens.map(|g| std::array::from_fn(|k| (g.weight * HARMONICS[k].1 as f64) as f32));
+        let phase = gens.map(|g| g.phase.map(|p| p as f32));
         let hits = &map.hits;
 
         for (block, out) in out.chunks_mut(BLOCK).enumerate() {
@@ -142,16 +175,18 @@ impl Animator {
                 map.offsets[c0 + out.len()] as usize,
             );
             let vals = &mut self.vals[..h1 - h0];
-            let (w, psi0, om) = (
+            let (w, phi0, om) = (
                 &hits.weight[h0..h1],
-                &self.psi0[h0..h1],
+                &hits.phi0[h0..h1],
                 &hits.omega[h0..h1],
             );
-            for (((v, &w), &p), &o) in vals.iter_mut().zip(w).zip(psi0).zip(om) {
-                let psi = p - o * tau;
+            for (((v, &w), &p), &o) in vals.iter_mut().zip(w).zip(phi0).zip(om) {
                 let mut tx = 1.0;
-                for (k, &(m, a, _)) in HARMONICS.iter().enumerate() {
-                    tx += a * fast_sin(m * psi + drift[k]);
+                for g in 0..2 {
+                    let psi = p - o * age[g];
+                    for k in 0..NH {
+                        tx += amp[g][k] * fast_sin(HARMONICS[k].0 * psi + phase[g][k]);
+                    }
                 }
                 *v = w * tx;
             }
@@ -168,26 +203,14 @@ impl Animator {
             }
         }
     }
-
-    fn rebase(&mut self, map: &LensingMap, epoch: f64) {
-        for ((p, &phi0), &om) in self
-            .psi0
-            .iter_mut()
-            .zip(&map.hits.phi0)
-            .zip(&map.hits.omega)
-        {
-            let x = phi0 as f64 - om as f64 * epoch;
-            *p = (x - (x / TAU).round() * TAU) as f32;
-        }
-        self.epoch = epoch;
-    }
 }
 
 /// sin(x) for the texture kernel, branch-free so the per-hit loop vectorizes.
 /// Reduces x = q·π + r with |r| ≤ π/2 (π split Cody–Waite style so r stays
-/// exact for the kernel's |q| ≲ 30), then an odd degree-9 near-minimax
+/// exact for the kernel's |q| ≲ 160), then an odd degree-9 near-minimax
 /// polynomial (fitted on [−π/2, π/2]); sin x = (−1)^q · sin r. Absolute
-/// error ≲ 2e-7 for |x| ≲ 1e3.
+/// error ≲ 3e-7 for |x| ≲ 1e3. Kernel arguments: |m·ψ| ≤ 7·(π + Ω(6.1)·L)
+/// ≈ 470, plus a phase < 2π.
 #[inline(always)]
 fn fast_sin(x: f32) -> f32 {
     const PI_HI: f32 = 3.140625; // 8 significant bits: q·PI_HI is exact
@@ -222,11 +245,7 @@ mod tests {
             .map(|i| {
                 let mut acc = m.base[i] as f64;
                 for j in m.offsets[i] as usize..m.offsets[i + 1] as usize {
-                    let psi = m.hits.phi0[j] as f64 - m.hits.omega[j] as f64 * t;
-                    let mut tx = 1.0;
-                    for (mk, a, c) in HARMONICS {
-                        tx += a as f64 * (mk as f64 * psi + c as f64 * t).sin();
-                    }
+                    let tx = tex(m.hits.phi0[j] as f64, m.hits.omega[j] as f64, t);
                     acc += m.hits.weight[j] as f64 * tx;
                 }
                 acc
@@ -244,8 +263,8 @@ mod tests {
     #[test]
     fn fast_sin_accuracy() {
         let mut worst = 0.0f64;
-        for i in -200_000..=200_000 {
-            let x = i as f32 * 5e-4; // |x| ≤ 100, beyond the kernel's range
+        for i in -1_200_000..=1_200_000 {
+            let x = i as f32 * 5e-4; // |x| ≤ 600, beyond the kernel's range
             worst = worst.max((fast_sin(x) as f64 - (x as f64).sin()).abs());
         }
         assert!(worst < 3e-7, "fast_sin max abs error {worst:e}");
@@ -331,19 +350,87 @@ mod tests {
 
     #[test]
     fn tex_positive_and_centered() {
-        let mut min = f32::MAX;
+        let mut min = f64::MAX;
         let mut sum = 0.0f64;
-        let n = 10_000;
+        let n = 100_000;
         for i in 0..n {
-            let v = tex(i as f32 * 0.01, i as f32 * 0.003);
+            let x = i as f64;
+            let v = tex(x * 0.01, omega(8.0 + (x * 0.37) % 36.0), x * 0.7);
             min = min.min(v);
-            sum += v as f64;
+            sum += v;
         }
         assert!(min > 0.0, "tex must stay positive, min = {min}");
         assert!(
-            (sum / n as f64 - 1.0).abs() < 0.05,
+            (sum / n as f64 - 1.0).abs() < 0.02,
             "tex should average ≈ 1"
         );
+    }
+
+    #[test]
+    fn generations_partition_time() {
+        for i in -2000..2000 {
+            let t = i as f64 * 1.37;
+            let [young, old] = generations(t);
+            assert!((young.weight + old.weight - 1.0).abs() < 1e-12, "t = {t}");
+            assert!((0.0..LIFETIME / 2.0).contains(&young.age), "t = {t}");
+            assert!((old.age - young.age - LIFETIME / 2.0).abs() < 1e-9);
+            assert_ne!(young.phase, old.phase, "each generation is a new pattern");
+        }
+    }
+
+    #[test]
+    fn tex_is_continuous_across_generation_changes() {
+        // Births and deaths happen at weight 0: no visible jump.
+        let eps = 1e-6;
+        for g in -3..6 {
+            let t = g as f64 * LIFETIME / 2.0;
+            for (phi0, om) in [(0.3, omega(8.0)), (-2.0, -omega(20.0)), (1.1, omega(40.0))] {
+                let jump = (tex(phi0, om, t + eps) - tex(phi0, om, t - eps)).abs();
+                assert!(jump < 1e-5, "jump {jump} at t = {t}");
+            }
+        }
+    }
+
+    /// Mean horizontal-neighbour correlation of the texture modulation
+    /// I/I_static − 1 over the disk cells of a default ASCII frame.
+    fn neighbour_correlation(m: &LensingMap, t: f64) -> f64 {
+        let stat: Vec<f64> = (0..m.w * m.h)
+            .map(|i| {
+                (m.offsets[i]..m.offsets[i + 1])
+                    .map(|j| m.hits.weight[j as usize] as f64)
+                    .sum()
+            })
+            .collect();
+        let mut out = vec![0.0f32; m.w * m.h];
+        Animator::new(m).evaluate(m, t, &mut out);
+        let md = |i: usize| (stat[i] > 1e-3).then(|| out[i] as f64 / stat[i] - 1.0);
+        let (mut s, mut s2, mut n, mut c, mut nc) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for y in 0..m.h {
+            for x in 0..m.w {
+                let Some(v) = md(y * m.w + x) else { continue };
+                (s, s2, n) = (s + v, s2 + v * v, n + 1.0);
+                if let Some(u) = (x + 1 < m.w).then(|| md(y * m.w + x + 1)).flatten() {
+                    (c, nc) = (c + v * u, nc + 1.0);
+                }
+            }
+        }
+        let var = s2 / n - (s / n).powi(2);
+        (c / nc - (s / n).powi(2)) / var
+    }
+
+    #[test]
+    fn texture_stays_coherent_for_hours() {
+        // Unbounded shear winding used to decorrelate neighbouring cells
+        // (correlation 0.24 after an hour); finite lifetimes cap it.
+        let scene = Scene {
+            stars: false,
+            ..Scene::default()
+        };
+        let m = map::build(&scene, 120 * 3, 40 * 3).downsample(3);
+        for t in [10.0, 300.0, 28_800.0, 28_800.0 + 700.0, 691_200.0] {
+            let c = neighbour_correlation(&m, t);
+            assert!(c > 0.7, "t = {t}: neighbour correlation {c:.2}");
+        }
     }
 
     #[test]

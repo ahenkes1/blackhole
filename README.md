@@ -1,7 +1,45 @@
 # blackhole
 
 A general-relativistic black-hole accretion-disk animation for **monochrome
-terminals**, cheap enough to run as a screensaver. Rust, zero dependencies.
+terminals**, cheap enough to run as a screensaver. Rust, zero dependencies,
+Unix only (Linux, macOS, BSDs — it drives the terminal via `/dev/tty` and
+`stty`).
+
+```text
+
+
+                                             .......                                 .
+                                     .::---==========--:::.
+                                 .:-==+===============---==--:..
+                              .-=++===+***++**+===+*++++++=--==--:.
+                           .-++*+++##**+***+++=+=====++==+++*+--===-:.
+                        .:=***++###**#**++==:------:---===+++++*+--==--:.
+                     ..-+*#*+*%%####**+==:..        ...::-===++++**=====-::.
+                 ...-+*##**#%%#%###**+-.                 .:-==++**+*#*=--==-::..
+           .....-=*####*#%@%%%%%%#**-      : :    . :      .:-==++**+**#*=-------::.:     .
+   ...:::::-=*##%%%###%@@%%@@%%%%#+.    -.            .:     .:-++***#*+*****+=---:::::::....
+------=*##%%%%%##%%@@@%@@@@@@@%%#=                            .:-=++*+*******+******+=---:::::..
+=+#%%%%@@%%%%%@@@@@@@@@@@@@@@@%#-     :                  .      .--==+++**+***+***++++++++*+++=-
+@@@@@@@%*%@@@@@%@@@@@@@@@@@@%%=      +                    -      ..:--==++++++***+=+****+=====++
+@@@@@@%+#@@@@@%%@@@@@@@@@@@@%@**-- =#:                    .+-  ...----==++-+*+-=**#+-=++*##*+===
+@@@@@@@@%%%%@@@@@@@@@@@@@@@@@@#%@@@@###*++**++=++=++=--:-==*#*-+*++++=*++**++++*##*=-=+++*##*+==
+*#%@@@@@@@@@@@%%@%%@@@@@@@@@%%@@@@@@@%#%%%%%%%%%%%%###*#####%%%#*++*******###**++===+++**###*+=-
+###****##%%%@@@@@@@@@@@@@%%%%%%%%@@@@%%%%%%%##########%####%%%%######****++===++++***####*+==--=
+###############*****######%%%%%%%%@@@@%%%%%############**##%%#*+++++++*******#######**+===--===-
+%%%%%%%%%%%%%%####################%%@@%%##************###%%%%%##############**+++====---==-----:
+####%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@@@@%%%%%%%%%%%%%%%%%%%###****++++=====--------------::::::
+====+++++++++************************#%%%%%%#%%%#%#######*+==---=-----------------::::::::..::::
+------------------------------------=--=+***###***#****+=--------------:::::::::.........:::::::
+--------------------------------------------========--::::::::::::::.................::::::::::-
+:::::::::::::::::::::::::::::::::::::::::::::::::::.............................::::::::::::::::
+.........................................:.................................:::::::::::::::::::::
+........................................................................::::::::::::::::::::....
+..........................................................................................:.....
+..............:.................................................................................
+```
+
+<sub>One ASCII frame (96×30, `blackhole > frame.txt`). `--style braille`
+renders 2×4 dithered dots per cell for finer detail.</sub>
 
 Physics after Florentin Jaffredo's ["Black hole rendering with
 SageMath"](https://sagemanifolds.obspm.fr/) notebook: backward ray tracing of
@@ -23,8 +61,11 @@ minutes:
   g = √(1−3M/r) / (√(1−2M/r_cam)·(1−Ω·L_z)) is closed-form.
 - **Per frame**, only the turbulent emission pattern is advected with
   Keplerian differential rotation Ω = √(M/r³) through the baked map:
-  a vectorized, branch-free pass of a handful of flops per disk crossing,
-  with phases re-anchored in f64 so the animation stays exact for days.
+  a vectorized, branch-free pass of a handful of flops per disk crossing.
+  Like real disk turbulence, patterns have a finite lifetime (2 min at
+  default speed): each is born, sheared into spirals and cross-faded into
+  the next, so the shear never winds the texture into grain and the
+  animation looks the same after days as after seconds.
   Tone mapping is folded into precomputed thresholds, and only the cells
   whose glyph changed are sent — one terminal write per frame.
 
@@ -34,6 +75,11 @@ arcs above and below the hole, the secondary image, one side of the disk
 Doppler-boosted (g³ by default, bolometric g⁴ via `--beaming`) far brighter
 than the other, gravitationally dimmed emission near the inner edge, and
 background stars smeared into Einstein arcs around the shadow.
+
+Deliberate simplifications: the camera is static at r = 60 M, the disk's
+optical-thickness boost uses a Euclidean incidence angle, and all images of
+the disk are drawn at the same time (the extra light-travel time of the
+secondary images is ignored — invisible for a random texture).
 
 ## Usage
 
@@ -47,18 +93,25 @@ blackhole --help          # all options
 
 Options: `--fps`, `--inclination`, `--rin/--rout`, `--stars on|off`,
 `--rotation cw|ccw`, `--beaming`, `--zoom`, `--speed`, `--exposure`,
-`--aspect`, `--seed`. Numeric values must be finite; bounds: fps ≤ 240,
-rout ≤ 500.
+`--aspect`, `--seed`. Numeric values must be finite; bounds: 1 ≤ fps ≤ 240,
+−90 ≤ inclination ≤ 90, 6.1 ≤ rin < rout < 60 (inside the ISCO no stable
+orbits exist; beyond the camera distance the disk would reach the camera).
 
 Screensaver-style use: run it fullscreen, e.g. `konsole --fullscreen -e blackhole`.
+It exits on any key, and restores the terminal on `SIGTERM`/`SIGHUP` too.
+With stdout redirected or piped it prints a single frame instead of animating.
 
 ## Performance
 
 Target: < 5 % of one core at 20 fps in a fullscreen terminal; map rebuild
 (startup and on resize) well under a second. `--bench` measures both — frames
-are timed an hour into the animation, where the sheared texture is at its
-most expensive — and reports the output rate the terminal has to absorb: at
-20 fps only ~1–2 % of cells change per frame, so updates carry just those
-(plus a full repaint every 10 s). Cost scales with the samples evaluated:
+are timed an hour into the animation — and reports the output rate the
+terminal has to absorb: at 20 fps only a few % of cells change per frame, so
+updates carry just those (plus a full repaint every 10 s). Typical: ~0.6 ms
+per frame (≈ 1 % of a core) at 200×60, map build ~15 ms. Cost scales with the samples evaluated:
 braille takes 8 per cell, ASCII 9 (anti-aliasing supersamples; 4 on very
 large terminals).
+
+## License
+
+[MIT](LICENSE) © 2026 Alexander Henkes

@@ -1,9 +1,14 @@
 [package]
 name = "blackhole"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.87"
 description = "Schwarzschild black-hole accretion-disk screensaver for monochrome terminals"
 license = "MIT"
+repository = "https://github.com/ahenkes1/blackhole"
+readme = "README.md"
+keywords = ["black-hole", "terminal", "screensaver", "ascii-art", "relativity"]
+categories = ["command-line-utilities", "science", "visualization"]
 
 # Zero dependencies by design: pure std + ANSI escapes + stty(1).
 

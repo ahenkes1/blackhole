@@ -261,7 +261,7 @@ pub fn g_factor(r_emit: f64, lz: f64, r_cam: f64) -> f64 {
     (1.0 - 3.0 / r_emit).max(0.0).sqrt() / ((1.0 - 2.0 / r_cam).sqrt() * doppler)
 }
 
-fn splitmix64(mut z: u64) -> u64 {
+pub(crate) fn splitmix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E3779B97F4A7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
@@ -270,15 +270,16 @@ fn splitmix64(mut z: u64) -> u64 {
 
 /// Deterministic sparse procedural star field sampled by unit direction.
 /// ≈ 1–3 % of directions land on a star; brightness in (0, 0.9]; the rest 0.
+///
+/// Stars are the cells of a 3D cubic lattice (6 mrad pitch) where it meets
+/// the unit sphere: compact blobs of ≲ 10 mrad in every direction. (A grid in
+/// polar coordinates would put its pole on the line of sight and draw
+/// radial needles there, the opposite of the tangential Einstein arcs.)
 pub fn star_intensity(dir: [f64; 3], seed: u64) -> f32 {
-    // ~6 mrad grid on (z, azimuth); slight pole distortion is invisible.
-    let iz = ((dir[2] + 1.0) / 0.006).floor() as u64;
-    let ia = ((dir[1].atan2(dir[0]) + std::f64::consts::PI) / 0.006).floor() as u64;
-    let h = splitmix64(
-        iz.wrapping_mul(0x9E3779B97F4A7C15)
-            ^ ia.wrapping_mul(0xBF58476D1CE4E5B9)
-            ^ seed.wrapping_mul(0x94D049BB133111EB),
-    );
+    const CELL: f64 = 0.006;
+    let h = dir.iter().fold(splitmix64(seed), |h, &d| {
+        splitmix64(h ^ (d / CELL).floor() as i64 as u64)
+    });
     if h & 63 != 0 {
         return 0.0;
     }
@@ -520,6 +521,18 @@ mod tests {
     }
 
     #[test]
+    fn extreme_inclinations_are_finite() {
+        // Edge-on (±90°) puts the camera in the disk plane: crossings
+        // degenerate to grazing incidence but must stay finite and visible.
+        for incl in [-90.0, -30.0, 90.0] {
+            let map = build(&small_scene(incl, true), 61, 41);
+            assert!(map.hits.weight.iter().all(|w| w.is_finite() && *w >= 0.0));
+            assert!(map.base.iter().all(|b| b.is_finite()));
+            assert!(!map.hits.is_empty(), "incl {incl}: disk invisible");
+        }
+    }
+
+    #[test]
     fn center_ray_is_captured_and_dark() {
         let map = build(&small_scene(81.0, true), 41, 41);
         assert_eq!(hit_count(&map, 20, 20), 0);
@@ -610,6 +623,32 @@ mod tests {
         assert_eq!(same.offsets, full.offsets);
         assert_eq!(same.hits.weight, full.hits.weight);
         assert_eq!(same.base, full.base);
+    }
+
+    #[test]
+    fn stars_are_compact_near_line_of_sight() {
+        // Around the view axis −ẑ, a star must not extend much further
+        // radially than tangentially: scan radial lines at 1 mrad steps and
+        // bound the longest lit run by the lattice cell's diagonal.
+        let mut longest = 0;
+        let mut lit = 0;
+        for j in 0..2000 {
+            let beta = j as f64 * 0.0031;
+            let mut run = 0;
+            for i in 0..250 {
+                let th = 0.05 + i as f64 * 1e-3;
+                let d = [th.sin() * beta.cos(), th.sin() * beta.sin(), -th.cos()];
+                if star_intensity(d, 7) > 0.0 {
+                    lit += 1;
+                    run += 1;
+                    longest = longest.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        assert!(lit > 0, "no stars near the line of sight");
+        assert!(longest <= 11, "radial star streak of {longest} mrad");
     }
 
     #[test]

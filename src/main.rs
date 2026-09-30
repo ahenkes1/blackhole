@@ -1,7 +1,9 @@
 //! Terminal frontend: CLI, raw-mode lifecycle, frame loop.
 //!
-//! Zero dependencies: raw mode via `stty -F /dev/tty` (settings saved with
-//! `stty -g` and restored on exit/panic), screen control via ANSI escapes
+//! Unix only. Zero dependencies: raw mode via stty(1) run with stdin on
+//! /dev/tty — portable across GNU and BSD/macOS stty, unlike `-F`/`-f` —
+//! (settings saved with `stty -g` and restored on exit, panic, or a
+//! SIGHUP/SIGINT/SIGQUIT/SIGTERM), screen control via ANSI escapes
 //! (alternate screen 1049h/l, cursor hide/show and positioning), input via a
 //! thread doing blocking 1-byte reads from /dev/tty into an mpsc channel —
 //! ANY byte (including Ctrl-C = 0x03 in raw mode) exits cleanly. Terminal
@@ -15,19 +17,21 @@
 //! cells that changed since the previous frame (full repaint at start, after
 //! a resize, and every FULL_REPAINT_SECS) → a single write(2), wrapped in
 //! synchronized-output markers so supporting terminals never show a
-//! half-drawn frame. At 20 fps only ~1–2 % of cells change per frame, so the
+//! half-drawn frame. At 20 fps only a few % of cells change per frame, so the
 //! terminal parses and redraws roughly a tenth of a full repaint.
+//!
+//! If stdout is not a terminal (redirected or piped), a single frame is
+//! printed instead, sized from the controlling terminal if there is one.
 //!
 //! `--bench` touches no terminal state: it builds the map for the given (or
 //! current) size and times it, then renders 200 consecutive frames at the
-//! target fps starting an hour into the animation — steady state: by then
-//! differential rotation has sheared the texture, and frame-to-frame changes
-//! are what the live loop sees — and prints map-build ms, mean frame ms,
-//! estimated CPU share, and output bytes/s.
+//! target fps starting an hour into the animation — steady state, with
+//! frame-to-frame changes like the live loop sees — and prints map-build ms,
+//! mean frame ms, estimated CPU share, and output bytes/s.
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::os::fd::AsFd as _;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use blackhole::disk;
@@ -40,8 +44,9 @@ const TIME_SCALE: f64 = 8.0;
 
 /// Frame pacing bound: beyond this the fixed-period loop is pure busy-spin.
 const MAX_FPS: u32 = 240;
-/// r_escape = 2·r_out drives fan integration cost; keep startup bounded.
-const MAX_ROUT: f64 = 500.0;
+/// Smallest --rin: just outside the ISCO (r = 6), the disk's physical inner
+/// edge; Keplerian orbits further in are unstable.
+const MIN_RIN: f64 = 6.1;
 
 /// Unconditional full-repaint period: repairs anything else that drew on
 /// the terminal since the last one.
@@ -63,8 +68,10 @@ USAGE: blackhole [OPTIONS]           (any key exits)
 
   --style ascii|braille   renderer (default ascii)
   --fps N                 target frames per second, 1..=240 (default 20)
-  --inclination DEG       viewing inclination, 90 = edge-on (default 81)
-  --rin R --rout R        disk annulus in units of M (default 8, 44; rout <= 500)
+  --inclination DEG       viewing inclination, -90..=90; 0 = face-on,
+                          90 = edge-on, negative = from below (default 81)
+  --rin R --rout R        disk annulus in units of M (default 8, 44);
+                          6.1 <= rin < rout < 60 (the camera distance)
   --stars on|off          lensed background star field (default on)
   --rotation cw|ccw       disk rotation sense (default ccw)
   --beaming N             Doppler beaming exponent g^N (default 3, bolometric 4)
@@ -190,7 +197,10 @@ fn try_parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> 
             }
             "--inclination" => {
                 let v: f64 = next_finite(&mut it, "--inclination")?;
-                args.scene.incl_deg = v.clamp(0.0, 89.9);
+                if !(-90.0..=90.0).contains(&v) {
+                    return Err("--inclination must be in -90..=90".into());
+                }
+                args.scene.incl_deg = v;
             }
             "--rin" => args.scene.r_in = next_finite(&mut it, "--rin")?,
             "--rout" => args.scene.r_out = next_finite(&mut it, "--rout")?,
@@ -238,13 +248,14 @@ fn try_parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> 
             _ => return Err(format!("unknown option '{flag}'")),
         }
     }
-    if !(args.scene.r_in >= 6.1 && args.scene.r_in < args.scene.r_out) {
+    // The camera must stay outside the disk: at r_out ≥ r_cam the annulus
+    // would reach the camera's own position near edge-on views.
+    let r_cam = args.scene.r_cam;
+    let (r_in, r_out) = (args.scene.r_in, args.scene.r_out);
+    if !(r_in >= MIN_RIN && r_in < r_out && r_out < r_cam) {
         return Err(format!(
-            "disk radii must satisfy 6.1 <= rin < rout <= {MAX_ROUT}"
+            "disk radii must satisfy {MIN_RIN} <= rin < rout < {r_cam} (the camera distance)"
         ));
-    }
-    if args.scene.r_out > MAX_ROUT {
-        return Err(format!("--rout must be <= {MAX_ROUT}"));
     }
     Ok(args)
 }
@@ -269,6 +280,17 @@ struct TerminalGuard {
     restored: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Run stty(1) on the controlling terminal. It operates on its stdin, so
+/// that is opened on /dev/tty: portable, where the device flag is `-F` on
+/// GNU but `-f` on BSD/macOS.
+fn stty(args: &[&str]) -> std::io::Result<Output> {
+    Command::new("stty")
+        .args(args)
+        .stdin(std::fs::File::open("/dev/tty")?)
+        .stderr(Stdio::null())
+        .output()
+}
+
 fn restore_terminal(saved_stty: &str, restored: &std::sync::atomic::AtomicBool) {
     if restored.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -276,17 +298,13 @@ fn restore_terminal(saved_stty: &str, restored: &std::sync::atomic::AtomicBool) 
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(b"\x1b[?1049l\x1b[?25h");
     let _ = out.flush();
-    let _ = Command::new("stty")
-        .args(["-F", "/dev/tty", saved_stty])
-        .status();
+    let _ = stty(&[saved_stty]);
 }
 
 impl TerminalGuard {
     fn new() -> std::io::Result<TerminalGuard> {
         let err = |m: &str| std::io::Error::other(m);
-        let saved = Command::new("stty")
-            .args(["-g", "-F", "/dev/tty"])
-            .output()?;
+        let saved = stty(&["-g"])?;
         if !saved.status.success() {
             return Err(err("stty -g failed (no controlling tty?)"));
         }
@@ -294,10 +312,7 @@ impl TerminalGuard {
         if saved_stty.is_empty() {
             return Err(err("empty stty -g snapshot"));
         }
-        let status = Command::new("stty")
-            .args(["-F", "/dev/tty", "raw", "-echo"])
-            .status()?;
-        if !status.success() {
+        if !stty(&["raw", "-echo"])?.status.success() {
             return Err(err("stty raw failed"));
         }
         {
@@ -365,7 +380,7 @@ fn tty_winsize() -> Option<(usize, usize)> {
         xpixel: u16,
         ypixel: u16,
     }
-    extern "C" {
+    unsafe extern "C" {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -399,6 +414,39 @@ fn tty_winsize() -> Option<(usize, usize)> {
 )))]
 fn tty_winsize() -> Option<(usize, usize)> {
     None
+}
+
+/// Termination signals (SIGHUP, SIGINT, SIGQUIT, SIGTERM — the same numbers
+/// on Linux, macOS and the BSDs) only set a flag that the frame loop polls,
+/// so a `kill` or a screensaver manager stopping the process still exits
+/// through [`TerminalGuard`]'s restore instead of leaving the terminal raw.
+mod signals {
+    use std::ffi::c_int;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_signal(_: c_int) {
+        // An atomic store is async-signal-safe.
+        STOP.store(true, Ordering::Relaxed);
+    }
+
+    unsafe extern "C" {
+        /// `sighandler_t signal(int, sighandler_t)`, handler as an address.
+        fn signal(signum: c_int, handler: usize) -> usize;
+    }
+
+    pub fn install() {
+        for sig in [1, 2, 3, 15] {
+            // SAFETY: `on_signal` is an `extern "C" fn(c_int)`, the handler
+            // type signal(2) expects, and only touches an atomic.
+            unsafe { signal(sig, on_signal as extern "C" fn(c_int) as usize) };
+        }
+    }
+
+    pub fn stop_requested() -> bool {
+        STOP.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawn the blocking /dev/tty reader thread; returns a receiver that yields
@@ -574,28 +622,35 @@ impl FrameState {
     }
 }
 
+/// Print one plain frame (no escapes) to stdout: the output when there is no
+/// terminal to animate on, instead of hanging in a screensaver loop.
+fn print_single_frame(args: &Args) {
+    let (cols, rows) = term_size();
+    let mut st = FrameState::build(args, cols, rows);
+    st.render(0.0);
+    let mut out = Vec::new();
+    render::encode_full(args.style, &st.cells, cols, b"\n", &mut out);
+    out.push(b'\n');
+    let _ = std::io::stdout().write_all(&out);
+}
+
 fn main() {
     let args = parse_args();
     if args.bench {
         run_bench(&args);
         return;
     }
-
-    let guard = match TerminalGuard::new() {
-        Ok(g) => g,
-        Err(_) => {
-            // No controlling tty (piped/redirected): emit one frame and exit
-            // instead of hanging in a screensaver loop.
-            let (cols, rows) = term_size();
-            let mut st = FrameState::build(&args, cols, rows);
-            st.render(0.0);
-            let mut out = Vec::new();
-            render::encode_full(args.style, &st.cells, cols, b"\n", &mut out);
-            out.push(b'\n');
-            let _ = std::io::stdout().write_all(&out);
-            return;
-        }
+    // Redirected or piped stdout: animating would stream escape codes into
+    // a file forever. A missing controlling tty (TerminalGuard fails) too.
+    if !std::io::stdout().is_terminal() {
+        print_single_frame(&args);
+        return;
+    }
+    let Ok(guard) = TerminalGuard::new() else {
+        print_single_frame(&args);
+        return;
     };
+    signals::install();
 
     // One write(2) per frame: a dup of stdout as a plain File bypasses
     // stdout's LineWriter, which split each frame at its last newline into
@@ -618,14 +673,15 @@ fn main() {
     let mut frame_no: u64 = 0;
 
     loop {
-        if input.try_recv().is_ok() {
+        if input.try_recv().is_ok() || signals::stop_requested() {
             break;
         }
         let t_sim = start.elapsed().as_secs_f64() * args.speed * TIME_SCALE;
         st.render(t_sim);
         let update = st.update(frame_no.is_multiple_of(full_every));
-        if !update.is_empty() {
-            let _ = term.write_all(update);
+        // A failed write means the terminal is gone (hangup): stop.
+        if !update.is_empty() && term.write_all(update).is_err() {
+            break;
         }
 
         frame_no += 1;
@@ -698,8 +754,20 @@ mod tests {
     fn disk_radius_bounds() {
         assert!(parse(&["--rin", "6", "--rout", "44"]).is_err()); // below ISCO-ish
         assert!(parse(&["--rin", "44", "--rout", "8"]).is_err()); // inverted
-        assert!(parse(&["--rin", "8", "--rout", "501"]).is_err()); // past cap
-        assert!(parse(&["--rin", "6.1", "--rout", "500"]).is_ok());
+        assert!(parse(&["--rin", "8", "--rout", "60"]).is_err()); // reaches the camera
+        assert!(parse(&["--rin", "6.1", "--rout", "59.9"]).is_ok());
+    }
+
+    #[test]
+    fn inclination_bounds() {
+        for ok in ["-90", "0", "45.5", "90"] {
+            assert!(parse(&["--inclination", ok]).is_ok(), "{ok}");
+        }
+        for bad in ["-90.1", "91", "180"] {
+            assert!(parse(&["--inclination", bad]).is_err(), "{bad}");
+        }
+        let a = parse(&["--inclination", "90"]).unwrap();
+        assert_eq!(a.scene.incl_deg, 90.0); // no silent clamping
     }
 
     #[test]

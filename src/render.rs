@@ -342,13 +342,16 @@ mod tests {
         let lines: Vec<&str> = dark.split("\r\n").collect();
         assert_eq!(lines.len(), rows);
         assert!(lines.iter().all(|l| l.chars().count() == cols));
-        assert!(dark
-            .chars()
-            .all(|c| c == '\u{2800}' || c == '\r' || c == '\n'));
+        assert!(
+            dark.chars()
+                .all(|c| c == '\u{2800}' || c == '\r' || c == '\n')
+        );
         let bright = braille(&vec![1e6; ws * hs], ws, hs);
-        assert!(bright
-            .split("\r\n")
-            .all(|l| l.chars().all(|c| c == '\u{28FF}')));
+        assert!(
+            bright
+                .split("\r\n")
+                .all(|l| l.chars().all(|c| c == '\u{28FF}'))
+        );
     }
 
     #[test]
